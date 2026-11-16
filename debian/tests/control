@@ -199,3 +199,8 @@ Tests: bar-blocks
 Depends: regolith-session-flashback,
          i3status-rs
 Restrictions: allow-stderr, skippable, skip-not-installable
+
+Tests: convert-to-debian
+Depends: regolith-convert-to-debian,
+         util-linux
+Restrictions: allow-stderr

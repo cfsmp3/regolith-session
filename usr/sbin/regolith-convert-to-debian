@@ -1,0 +1,1147 @@
+#!/bin/bash
+# Moves a Regolith desktop running on Ubuntu 26.04 to Debian forky in place.
+# The package sources are switched to Debian and to Regolith's Debian archive,
+# every installed package moves to the version those sources provide, Ubuntu
+# packages without a Debian counterpart are removed, and the machine's
+# identity files are left saying Debian. The packages of the running kernel
+# stay installed as a fallback until the Debian kernel has booted.
+#
+# Run with --help for the options and exit statuses.
+
+set -u -o pipefail
+umask 022
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true APT_LISTCHANGES_FRONTEND=none
+unset APT_CONFIG
+
+readonly PROG=regolith-convert-to-debian
+readonly SUITE=forky
+readonly STATE_DIR=/var/lib/$PROG
+readonly STATE_FILE=$STATE_DIR/state
+readonly BACKUP_DIR=/var/backups/$PROG
+readonly UBUNTU_KEYRING=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+readonly DEFAULT_KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg
+readonly DEBIAN_SOURCES=/etc/apt/sources.list.d/debian.sources
+readonly W=$STATE_DIR
+
+# Ubuntu packages whose role a differently named Debian package takes over.
+# An empty successor drops the package without a replacement; @ARCH@ stands
+# for the system's architecture.
+declare -A REPLACEMENTS=(
+    [coreutils-from-uutils]=coreutils
+    [coreutils-from-gnu]=coreutils
+    [gnu-coreutils]=coreutils
+    [linux-generic]=linux-image-@ARCH@
+    [linux-image-generic]=linux-image-@ARCH@
+    [linux-headers-generic]=linux-headers-@ARCH@
+    [linux-firmware]=firmware-linux
+    [ubuntu-keyring]=""
+)
+
+DEBIAN_MIRROR=http://deb.debian.org/debian
+DEBIAN_KEYRING=$DEFAULT_KEYRING
+KEYRING_GIVEN=0
+REGOLITH_MIRROR=https://archive.regolith-desktop.com
+REGOLITH_STAGE=
+ASSUME_YES=0
+DRY_RUN=0
+RESUME=0
+WORK_CREATED=0
+COMMITTED=0
+NATIVE_ARCH=
+
+STAGE_OPTS=(
+    -o "Dir::Etc::sourcelist=$W/etc/sources.list"
+    -o "Dir::Etc::sourceparts=$W/etc/sources.list.d"
+    -o "Dir::Etc::preferences=$W/etc/preferences"
+    -o "Dir::Etc::preferencesparts=$W/etc/preferences.d"
+    -o "Dir::Cache::Archives=$W/archives"
+    -o "APT::Get::List-Cleanup=false"
+)
+TX_OPTS=(
+    -y -q --purge --allow-downgrades --allow-remove-essential
+    -o "Dpkg::Options::=--force-confdef"
+    -o "Dpkg::Options::=--force-confold"
+    -o "Dpkg::Options::=--force-overwrite"
+    -o "Dpkg::Use-Pty=false"
+    -o "DPkg::Lock::Timeout=120"
+    -o "DPkg::Path=$W/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+msg() {
+    local text="$*"
+    printf '%s: %s\n' "$PROG" "${text//[$'\n\r']/ }" >&2
+}
+
+decline() {
+    msg "$@"
+    exit 2
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options]
+
+Convert this Regolith system from Ubuntu 26.04 to Debian $SUITE in place,
+keeping Regolith installed from its Debian archive.
+
+Options:
+  --debian-mirror URL     Debian archive (default http://deb.debian.org/debian)
+  --debian-keyring FILE   keyring that signs the Debian archive
+                          (default $DEFAULT_KEYRING)
+  --regolith-mirror URL   Regolith archive (default https://archive.regolith-desktop.com)
+  --regolith-stage STAGE  Regolith stage to use on Debian: testing or unstable
+                          (default: the stage the Regolith sources use now)
+  --yes                   proceed without asking
+  --dry-run               report what would change, change nothing
+  --resume                finish a conversion that stopped partway
+  -h, --help              show this help and exit
+
+Exit status:
+  0  converted, or dry run done
+  2  declined; nothing was changed
+  3  failed before any package changed; everything was restored
+  4  failed after packages started changing; run again with --resume to finish
+
+The packages of the running kernel are kept so the machine can still boot
+it; remove them once the Debian kernel works. The original files below
+/etc/apt are kept in $BACKUP_DIR/apt.
+EOF
+}
+
+usage_error() {
+    decline "$*; see $PROG --help"
+}
+
+# A fault before any package changed: undo the preparations and stop.
+fault() {
+    msg "$*; the system was left as it was"
+    cleanup_work
+    exit 3
+}
+
+cleanup_work() {
+    if [ "$WORK_CREATED" = 1 ] && [ "$COMMITTED" = 0 ]; then
+        rm -rf "$STATE_DIR"
+    fi
+}
+
+parse_args() {
+    local opt value
+    while [ $# -gt 0 ]; do
+        opt=$1
+        case "$opt" in
+            --debian-mirror=*|--debian-keyring=*|--regolith-mirror=*|--regolith-stage=*)
+                value=${opt#*=}
+                opt=${opt%%=*}
+                shift
+                ;;
+            --debian-mirror|--debian-keyring|--regolith-mirror|--regolith-stage)
+                [ $# -ge 2 ] || usage_error "option $opt needs a value"
+                value=$2
+                shift 2
+                ;;
+            --yes) ASSUME_YES=1; shift; continue ;;
+            --dry-run) DRY_RUN=1; shift; continue ;;
+            --resume) RESUME=1; shift; continue ;;
+            -h|--help) usage; exit 0 ;;
+            *) usage_error "unknown argument '$opt'" ;;
+        esac
+        case "$value" in
+            ''|--*) usage_error "option $opt needs a value" ;;
+            *[[:space:][:cntrl:]]*) usage_error "the value of $opt must not contain spaces or control characters" ;;
+        esac
+        case "$opt" in
+            --debian-mirror|--regolith-mirror)
+                [[ $value =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]] ||
+                    usage_error "the value of $opt must be a URL such as https://host/path"
+                ;;
+        esac
+        case "$opt" in
+            --debian-mirror) DEBIAN_MIRROR=$value ;;
+            --debian-keyring)
+                # apt reads Signed-By as an absolute path.
+                case "$value" in
+                    /*) DEBIAN_KEYRING=$value ;;
+                    *) DEBIAN_KEYRING=$PWD/$value ;;
+                esac
+                KEYRING_GIVEN=1
+                ;;
+            --regolith-mirror) REGOLITH_MIRROR=$value ;;
+            --regolith-stage)
+                case "$value" in
+                    testing|unstable) REGOLITH_STAGE=$value ;;
+                    *) usage_error "unknown Regolith stage '$value'" ;;
+                esac
+                ;;
+        esac
+    done
+    REGOLITH_BASE=$REGOLITH_MIRROR
+    while [ "${REGOLITH_BASE%/}" != "$REGOLITH_BASE" ]; do
+        REGOLITH_BASE=${REGOLITH_BASE%/}
+    done
+}
+
+# --- package sources ---------------------------------------------------------
+
+# Reads one source file and either reports its entries (mode=scan) or prints
+# the file as it reads after the conversion (mode=render). Metadata lines go
+# to stdout in scan mode and to the file named by meta in render mode:
+#   ubuntu <TAB> wants-deb-src <TAB> wants-non-free
+#   regolith <TAB> stage
+#   active <TAB> enabled-before <TAB> enabled-after
+read -r -d '' SOURCES_AWK <<'EOF'
+function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+function meta_out(line) { if (mode == "scan") print line; else print line > meta }
+function out(line) { if (mode == "render") print line }
+function host_of(u,   i, h) {
+    i = index(u, "://")
+    if (!i) return ""
+    h = substr(u, i + 3)
+    sub(/[\/?#].*$/, "", h)
+    sub(/^.*@/, "", h)
+    sub(/:[0-9]*$/, "", h)
+    return tolower(h)
+}
+function ubuntu_host(h,   n) {
+    n = length(h)
+    return h == "archive.ubuntu.com" || h == "security.ubuntu.com" || h == "ports.ubuntu.com" ||
+        (n > 19 && substr(h, n - 18) == ".archive.ubuntu.com")
+}
+# Sets STAGE for Regolith entries; returns ubuntu, regolith or third.
+function classify(uris, signedby,   n, a, m, b, i, u, base) {
+    STAGE = ""
+    n = split(trim(uris), a, /[ \t]+/)
+    for (i = 1; i <= n; i++)
+        if (ubuntu_host(host_of(a[i]))) return "ubuntu"
+    m = split(trim(signedby), b, /[ \t,]+/)
+    for (i = 1; i <= m; i++)
+        if (b[i] == ukey) return "ubuntu"
+    u = a[1]
+    sub(/\/+$/, "", u)
+    base = mirror "/ubuntu/"
+    if (u != "" && index(u, base) == 1) {
+        STAGE = substr(u, length(base) + 1)
+        sub(/\/.*$/, "", STAGE)
+        return "regolith"
+    }
+    return "third"
+}
+function has_word(list, word,   n, a, i) {
+    n = split(trim(list), a, /[ \t]+/)
+    for (i = 1; i <= n; i++) if (a[i] == word) return 1
+    return 0
+}
+function regolith_uri() { return mirror "/debian/" (stage != "" ? stage : STAGE) }
+function is_false(v) { v = tolower(trim(v)); return v == "no" || v == "false" || v == "off" || v == "without" || v == "disable" }
+
+function stanza(first, last,   k, line, idx, cur, nf, fkey, flow, fstart, fend, fval, f, uris, types, comps, signed, ef, enabled, kind, repl, del, ins) {
+    nf = 0; cur = 0
+    for (k = first; k <= last; k++) {
+        line = L[k]
+        if (line ~ /^#/) continue
+        if (line ~ /^[ \t]/) {
+            if (cur) { fend[cur] = k; fval[cur] = fval[cur] " " trim(line) }
+            continue
+        }
+        idx = index(line, ":")
+        if (!idx) continue
+        nf++; cur = nf
+        fkey[nf] = trim(substr(line, 1, idx - 1)); flow[nf] = tolower(fkey[nf])
+        fstart[nf] = k; fend[nf] = k; fval[nf] = trim(substr(line, idx + 1))
+    }
+    uris = ""; types = ""; comps = ""; signed = ""; ef = 0
+    for (f = 1; f <= nf; f++) {
+        if (flow[f] == "uris") uris = fval[f]
+        else if (flow[f] == "types") types = fval[f]
+        else if (flow[f] == "components") comps = fval[f]
+        else if (flow[f] == "signed-by") signed = fval[f]
+        else if (flow[f] == "enabled") ef = f
+    }
+    if (uris == "") {
+        for (k = first; k <= last; k++) out(L[k])
+        return
+    }
+    enabled = !(ef && is_false(fval[ef]))
+    kind = classify(uris, signed)
+    if (kind == "ubuntu")
+        meta_out("ubuntu\t" has_word(types, "deb-src") "\t" (has_word(comps, "restricted") || has_word(comps, "multiverse")))
+    if (kind == "regolith") meta_out("regolith\t" STAGE)
+    BEFORE += enabled
+    if (kind == "regolith") {
+        AFTER += enabled
+        for (f = 1; f <= nf; f++) {
+            if (flow[f] == "uris") repl[fstart[f]] = fkey[f] ": " regolith_uri()
+            else if (flow[f] == "suites") repl[fstart[f]] = fkey[f] ": testing"
+            else if (flow[f] == "components") repl[fstart[f]] = fkey[f] ": main"
+            else continue
+            for (k = fstart[f] + 1; k <= fend[f]; k++) del[k] = 1
+        }
+    } else if (enabled) {
+        if (ef) {
+            repl[fstart[ef]] = fkey[ef] ": no"
+            for (k = fstart[ef] + 1; k <= fend[ef]; k++) del[k] = 1
+        } else {
+            ins[fend[nf]] = "Enabled: no"
+        }
+    }
+    for (k = first; k <= last; k++) {
+        if (k in del) continue
+        out((k in repl) ? repl[k] : L[k])
+        if (k in ins) out(ins[k])
+    }
+}
+
+function one_line(line,   s, type, rest, opts, hasopts, e, c, comment, n, w, i, comps, signed, nopt, o, kind) {
+    s = trim(line)
+    if (s == "" || substr(s, 1, 1) == "#") { out(line); return }
+    type = s; sub(/[ \t].*$/, "", type)
+    if (type != "deb" && type != "deb-src") { out(line); return }
+    rest = trim(substr(s, length(type) + 1))
+    opts = ""; hasopts = 0
+    if (substr(rest, 1, 1) == "[") {
+        e = index(rest, "]")
+        if (!e) { out(line); return }
+        opts = substr(rest, 2, e - 2); hasopts = 1
+        rest = trim(substr(rest, e + 1))
+    }
+    comment = ""
+    if (match(rest, /[ \t]#/)) { comment = substr(rest, RSTART); rest = substr(rest, 1, RSTART - 1) }
+    n = split(trim(rest), w, /[ \t]+/)
+    if (n < 2) { out(line); return }
+    comps = ""
+    for (i = 3; i <= n; i++) comps = comps " " w[i]
+    signed = ""
+    nopt = split(trim(opts), o, /[ \t]+/)
+    for (i = 1; i <= nopt; i++)
+        if (o[i] ~ /^signed-by=/) signed = substr(o[i], 11)
+    kind = classify(w[1], signed)
+    BEFORE++
+    if (kind == "ubuntu")
+        meta_out("ubuntu\t" (type == "deb-src") "\t" (has_word(comps, "restricted") || has_word(comps, "multiverse")))
+    if (kind == "regolith") {
+        meta_out("regolith\t" STAGE)
+        AFTER++
+        out(type (hasopts ? " [" opts "]" : "") " " regolith_uri() " testing main" comment)
+        return
+    }
+    out("# disabled by regolith-convert-to-debian: " s)
+}
+
+{
+    if (fmt == "deb822") L[++NL] = $0
+    else one_line($0)
+}
+END {
+    if (fmt == "deb822") {
+        i = 1
+        while (i <= NL) {
+            if (L[i] ~ /^[ \t\r]*$/) { out(L[i]); i++; continue }
+            j = i
+            while (j <= NL && L[j] !~ /^[ \t\r]*$/) j++
+            stanza(i, j - 1)
+            i = j
+        }
+    }
+    meta_out("active\t" (BEFORE + 0) "\t" (AFTER + 0))
+}
+EOF
+
+source_files() {
+    find /etc/apt \( -name sources.list -o -name '*.list' -o -name '*.sources' \) -type f -print0 2>/dev/null | sort -z
+}
+
+sources_awk() {
+    local mode=$1 file=$2 meta=${3:-/dev/null} fmt=oneline
+    case "$file" in *.sources) fmt=deb822 ;; esac
+    awk -v mode="$mode" -v fmt="$fmt" -v meta="$meta" -v mirror="$REGOLITH_BASE" \
+        -v stage="$REGOLITH_STAGE" -v ukey="$UBUNTU_KEYRING" "$SOURCES_AWK" "$file"
+}
+
+# The process filesystem may be missing, so this program never uses bash
+# process substitution (it needs /dev/fd); lists go through pipes or files.
+scan_sources() {
+    local file
+    source_files | while IFS= read -r -d '' file; do
+        sources_awk scan "$file"
+    done
+}
+
+# Reads a newline-separated file into the named array, skipping empty lines.
+load_lines() {
+    local -n into=$1
+    local line
+    into=()
+    while IFS= read -r line; do
+        [ -z "$line" ] || into+=("$line")
+    done < "$2"
+}
+
+# Writes the converted copy of every source file that changes below
+# $W/stage/new, the new debian.sources, and an apt source tree in $W/etc that
+# holds exactly what apt will read once the conversion is applied.
+render_sources() {
+    local file rel new before after src extra name
+    mkdir -p "$W/stage/new" "$W/etc/sources.list.d" "$W/etc/preferences.d" "$W/archives/partial"
+    : > "$W/stage/changed"
+    : > "$W/stage/meta"
+    : > "$W/stage/disabled"
+    source_files > "$W/stage/files"
+    while IFS= read -r -d '' file; do
+        rel=${file#/etc/apt/}
+        new=$W/stage/new/$rel
+        mkdir -p "${new%/*}"
+        sources_awk render "$file" "$W/stage/file.meta" > "$new" || fault "cannot read $file"
+        cat "$W/stage/file.meta" >> "$W/stage/meta"
+        if cmp -s "$file" "$new"; then
+            rm -f "$new"
+        else
+            printf '%s\n' "$rel" >> "$W/stage/changed"
+        fi
+        read -r before after <<< "$(awk -F'\t' '$1 == "active" { print $2, $3 }' "$W/stage/file.meta")"
+        if [ "${before:-0}" -gt 0 ] && [ "${after:-0}" -eq 0 ]; then
+            printf '%s\n' "$file" >> "$W/stage/disabled"
+        fi
+    done < "$W/stage/files"
+
+    src=$(awk -F'\t' '$1 == "ubuntu" && $2 == 1 { print " deb-src"; exit }' "$W/stage/meta")
+    extra=$(awk -F'\t' '$1 == "ubuntu" && $3 == 1 { print " contrib non-free non-free-firmware"; exit }' "$W/stage/meta")
+    printf 'Types: deb%s\nURIs: %s\nSuites: %s\nComponents: main%s\nSigned-By: %s\n' \
+        "$src" "$DEBIAN_MIRROR" "$SUITE" "$extra" "$DEBIAN_KEYRING" > "$W/stage/debian.sources"
+
+    : > "$W/etc/preferences"
+    staged_copy sources.list "$W/etc/sources.list"
+    for file in /etc/apt/sources.list.d/*; do
+        [ -f "$file" ] || continue
+        name=${file##*/}
+        case "$name" in *.list|*.sources) ;; *) continue ;; esac
+        staged_copy "sources.list.d/$name" "$W/etc/sources.list.d/$name"
+    done
+    cp "$W/stage/debian.sources" "$W/etc/sources.list.d/debian.sources"
+}
+
+# Copies the converted form of /etc/apt/REL (or the file itself when it does
+# not change, or nothing at all when it is absent) to DEST.
+staged_copy() {
+    local rel=$1 dest=$2
+    if [ -f "$W/stage/new/$rel" ]; then
+        cp "$W/stage/new/$rel" "$dest"
+    elif [ -f "/etc/apt/$rel" ]; then
+        cp "/etc/apt/$rel" "$dest"
+    else
+        : > "$dest"
+    fi
+}
+
+apply_sources() {
+    local rel
+    while IFS= read -r rel; do
+        cat "$W/stage/new/$rel" > "/etc/apt/$rel" || return 1
+    done < "$W/stage/changed"
+    if [ -e "$DEBIAN_SOURCES" ] || [ -L "$DEBIAN_SOURCES" ]; then
+        echo 1 > "$W/stage/debian.existed"
+    fi
+    mkdir -p "${DEBIAN_SOURCES%/*}"
+    cat "$W/stage/debian.sources" > "$DEBIAN_SOURCES"
+}
+
+restore_sources() {
+    local rel
+    while IFS= read -r rel; do
+        cat "$BACKUP_DIR/apt/$rel" > "/etc/apt/$rel"
+    done < "$W/stage/changed"
+    if [ -e "$W/stage/debian.existed" ]; then
+        rm -f "$DEBIAN_SOURCES"
+        cp -a "$BACKUP_DIR/apt/sources.list.d/debian.sources" "$DEBIAN_SOURCES"
+    else
+        rm -f "$DEBIAN_SOURCES"
+    fi
+}
+
+# --- package planning ----------------------------------------------------------
+#
+# Packages are named the way apt prints them: the bare name for packages of
+# the native architecture (or "all"), name:arch for the packages of a foreign
+# architecture, so that libc6 and libc6:i386 are planned separately.
+
+# From `apt-cache policy`, prints "package<TAB>version" for the version apt
+# would pick among the configured archives, ignoring versions only dpkg knows.
+read -r -d '' TARGET_AWK <<'EOF'
+function flush() { if (pkg != "" && best != "") print pkg "\t" best }
+/^[^ \t].*:$/ { flush(); pkg = substr($0, 1, length($0) - 1); sub(":" native "$", "", pkg); best = ""; ver = ""; next }
+{
+    line = $0
+    sub(/^ *\*\*\* /, "    ", line)
+    n = split(line, t, " ")
+    if (t[1] == "Installed:" || t[1] == "Candidate:" || t[1] == "Version") next
+    if (n == 2 && t[2] ~ /^-?[0-9]+$/) { ver = t[1]; prio = t[2] + 0; counted = 0; next }
+    # An archive row names the archive and its index; the row of the
+    # installed version (dpkg's status file) has just priority and path.
+    if (ver != "" && !counted && n >= 3 && t[1] ~ /^-?[0-9]+$/) {
+        counted = 1
+        if (best == "" || prio > bestp) { best = ver; bestp = prio }
+    }
+}
+END { flush() }
+EOF
+
+# From `apt-cache policy` on the original sources, prints the packages whose
+# installed version is offered by a third-party archive.
+read -r -d '' ORIGIN_AWK <<'EOF'
+function norm(u) {
+    if (u ~ /^file:/) { u = substr(u, 6); sub(/^\/+/, "/", u) }
+    sub(/\/+$/, "", u)
+    return u
+}
+function host_of(u,   i, h) {
+    i = index(u, "://")
+    if (!i) return ""
+    h = substr(u, i + 3); sub(/[\/?#].*$/, "", h); sub(/^.*@/, "", h); sub(/:[0-9]*$/, "", h)
+    return tolower(h)
+}
+function third_party(u,   p, h, n) {
+    p = norm(u)
+    if (p == dm || index(p, dm "/") == 1 || p == rm || index(p, rm "/") == 1) return 0
+    h = host_of(u); n = length(h)
+    if (h == "archive.ubuntu.com" || h == "security.ubuntu.com" || h == "ports.ubuntu.com") return 0
+    if (n > 19 && substr(h, n - 18) == ".archive.ubuntu.com") return 0
+    return 1
+}
+BEGIN { dm = norm(dm); rm = norm(rm) }
+/^[^ \t].*:$/ { pkg = substr($0, 1, length($0) - 1); sub(":" native "$", "", pkg); inst = 0; next }
+{
+    star = ($0 ~ /^ *\*\*\* /)
+    line = $0
+    sub(/^ *\*\*\* /, "    ", line)
+    n = split(line, t, " ")
+    if (t[1] == "Installed:" || t[1] == "Candidate:" || t[1] == "Version") next
+    if (n == 2 && t[2] ~ /^-?[0-9]+$/) { inst = star; next }
+    if (inst && n >= 3 && t[1] ~ /^-?[0-9]+$/ && third_party(t[2]))
+        print pkg
+}
+EOF
+
+# From a failed `apt-get -s`, prints the requested packages that cannot be
+# installed from the new archives: a dependency that has no installable
+# version there, or that is itself being removed.
+read -r -d '' UNMET_AWK <<'EOF'
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+/^The following packages have unmet dependencies:/ { inblock = 1; next }
+inblock && !/^ / { inblock = 0 }
+inblock {
+    rest = $0
+    if (match(rest, /^ [^ ]+ : /)) {
+        cur = substr(rest, 2, RLENGTH - 4); sub(":" native "$", "", cur)
+        rest = substr(rest, RLENGTH + 1)
+    }
+    rest = trim(rest)
+    if (rest !~ /^(Pre-?)?Depends: /) next
+    name = rest; sub(/^[A-Za-z-]+: /, "", name); sub(/[ :(].*$/, "", name)
+    if (rest ~ /but it is not installable/ || rest ~ /but [^ ]+ is to be installed/ ||
+        (rest ~ /but it is not going to be installed/ && index(removed, " " name " ")))
+        print cur
+}
+EOF
+
+# From CONFFILES_FORMAT output, prints "package<TAB>md5<TAB>path" for each
+# conffile dpkg records for an installed package. A conffile line reads
+# " path md5", optionally followed by flags such as "obsolete".
+# shellcheck disable=SC2016 # dpkg-query expands the fields, not the shell
+readonly CONFFILES_FORMAT='${db:Status-Status}\t${Package}\t${Architecture}\n${Conffiles}\n'
+read -r -d '' CONFFILES_AWK <<'EOF'
+/^[^ ]/ {
+    split($0, h, "\t"); status = h[1]; pkg = h[2]
+    if (h[3] != "" && h[3] != "all" && h[3] != native) pkg = pkg ":" h[3]
+    next
+}
+/^ / && status == "installed" {
+    line = substr($0, 2)
+    m = split(line, w, " ")
+    while (m > 1 && w[m] !~ /^[0-9a-f]+$/ && w[m] != "newconffile") {
+        line = substr(line, 1, length(line) - length(w[m])); sub(/ +$/, "", line)
+        m = split(line, w, " ")
+    }
+    if (m < 2) next
+    path = substr(line, 1, length(line) - length(w[m])); sub(/ +$/, "", path)
+    print pkg "\t" w[m] "\t" path
+}
+EOF
+
+# A snapshot of the package states, to tell whether dpkg changed anything.
+dpkg_state() {
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Abbrev}\n' 2>/dev/null | sort
+}
+
+# Prints the local path of every archive listed by `apt-get --print-uris`.
+read -r -d '' URIS_AWK <<'EOF'
+function hexval(h,   i, v, c) {
+    v = 0; h = tolower(h)
+    for (i = 1; i <= length(h); i++) { c = index("0123456789abcdef", substr(h, i, 1)); v = v * 16 + c - 1 }
+    return v
+}
+function decode(s,   out, i, c) {
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "%" && i + 2 <= length(s)) { out = out sprintf("%c", hexval(substr(s, i + 1, 2))); i += 2 }
+        else out = out c
+    }
+    return out
+}
+/^'/ {
+    uri = $1; gsub(/'/, "", uri)
+    if (uri ~ /^file:/) { p = decode(substr(uri, 6)); sub(/^\/+/, "/", p); print p }
+    else print archives "/" $2
+}
+EOF
+
+# Prints "package<TAB>version" for every package dpkg knows in the given
+# states (default: installed), sorted by name.
+dpkg_packages() {
+    dpkg-query -W -f='${db:Status-Status}\t${Package}\t${Architecture}\t${Version}\n' 2>/dev/null |
+        awk -F'\t' -v native="$NATIVE_ARCH" -v states=" ${1:-installed} " '
+            index(states, " " $1 " ") {
+                name = ($3 == native || $3 == "all" || $3 == "") ? $2 : $2 ":" $3
+                print name "\t" $4
+            }' | sort -u -t "$(printf '\t')" -k1,1
+}
+
+installed_names() {
+    dpkg_packages | cut -f1
+}
+
+# The packages that hold the running kernel and its modules. The conversion
+# keeps them, so the machine can still boot a kernel known to work if the
+# Debian one does not.
+running_kernel_packages() {
+    local release
+    release=$(uname -r 2>/dev/null) || return 0
+    [ -n "$release" ] || return 0
+    dpkg-query -S "/boot/vmlinuz-$release" "/lib/modules/$release" "/usr/lib/modules/$release" 2>/dev/null |
+        awk -F': /' -v native="$NATIVE_ARCH" '
+            NF >= 2 && $1 !~ /^diversion / {
+                n = split($1, p, /, */)
+                for (i = 1; i <= n; i++) { sub(":" native "$", "", p[i]); print p[i] }
+            }' | sort -u
+}
+
+declare -A INSTALLED TARGET THIRD INSTALL REMOVE KEEP RUNNING
+REQ=()
+
+build_request() {
+    local name
+    REQ=()
+    for name in "${!INSTALL[@]}"; do
+        REQ+=("$name=${INSTALL[$name]}")
+    done
+    for name in "${!REMOVE[@]}"; do
+        REQ+=("$name-")
+    done
+    printf '%s\n' "${REQ[@]}" | sort > "$W/request"
+    load_lines REQ "$W/request"
+}
+
+plan_packages() {
+    local name version succ round progress
+    local -a names newly
+
+    dpkg_packages > "$W/installed"
+    while IFS=$'\t' read -r name version; do
+        INSTALLED[$name]=$version
+    done < "$W/installed"
+    names=("${!INSTALLED[@]}")
+    for name in "${!REPLACEMENTS[@]}"; do
+        succ=${REPLACEMENTS[$name]}
+        [ -z "$succ" ] || names+=("$succ")
+    done
+
+    apt-cache "${STAGE_OPTS[@]}" policy "${names[@]}" 2>/dev/null |
+        awk -v native="$NATIVE_ARCH" "$TARGET_AWK" > "$W/targets"
+    while IFS=$'\t' read -r name version; do
+        TARGET[$name]=$version
+    done < "$W/targets"
+    apt-cache policy "${!INSTALLED[@]}" 2>/dev/null |
+        awk -v native="$NATIVE_ARCH" -v dm="$DEBIAN_MIRROR" -v rm="$REGOLITH_BASE" "$ORIGIN_AWK" |
+        sort -u > "$W/third-party"
+    while IFS= read -r name; do
+        THIRD[$name]=1
+    done < "$W/third-party"
+    running_kernel_packages > "$W/running-kernel"
+    while IFS= read -r name; do
+        RUNNING[$name]=1
+    done < "$W/running-kernel"
+    apt-mark showauto 2>/dev/null | sed "s/:$NATIVE_ARCH\$//" | sort -u > "$W/auto"
+
+    for name in "${!INSTALLED[@]}"; do
+        if [ -n "${REPLACEMENTS[$name]+set}" ]; then
+            REMOVE[$name]=1
+            succ=${REPLACEMENTS[$name]}
+            if [ -n "$succ" ] && [ -n "${TARGET[$succ]:-}" ]; then
+                INSTALL[$succ]=${TARGET[$succ]}
+            fi
+        elif [ -n "${TARGET[$name]:-}" ]; then
+            INSTALL[$name]=${TARGET[$name]}
+        elif [ -n "${THIRD[$name]:-}" ] || [ -n "${RUNNING[$name]:-}" ]; then
+            KEEP[$name]=1
+        else
+            REMOVE[$name]=1
+        fi
+    done
+    # A successor can itself be installed already under its own name.
+    for name in "${!REMOVE[@]}"; do
+        unset "INSTALL[$name]"
+    done
+
+    # Drop the packages whose new version cannot be installed from the new
+    # archives, until apt accepts the whole change.
+    round=0
+    while :; do
+        build_request
+        if apt-get "${STAGE_OPTS[@]}" "${TX_OPTS[@]}" -s install "${REQ[@]}" > "$W/simulation" 2>&1 < /dev/null; then
+            break
+        fi
+        round=$((round + 1))
+        awk -v native="$NATIVE_ARCH" -v removed=" ${!REMOVE[*]} " "$UNMET_AWK" "$W/simulation" |
+            sort -u > "$W/unmet"
+        load_lines newly "$W/unmet"
+        progress=0
+        for name in "${newly[@]}"; do
+            if [ -n "${INSTALL[$name]:-}" ]; then
+                unset "INSTALL[$name]"
+                if [ -n "${INSTALLED[$name]:-}" ]; then
+                    REMOVE[$name]=1
+                fi
+                progress=1
+            elif [ -n "${RUNNING[$name]:-}" ] && [ -n "${KEEP[$name]:-}" ]; then
+                # The old kernel cannot stay next to the new packages.
+                unset "KEEP[$name]"
+                REMOVE[$name]=1
+                progress=1
+            fi
+        done
+        if [ "$progress" = 0 ] || [ "$round" -gt 100 ]; then
+            sed -n '/unmet dependencies/,$p' "$W/simulation" >&2
+            fault "the package changes for Debian $SUITE cannot be resolved"
+        fi
+    done
+    awk -v native="$NATIVE_ARCH" '$1 == "Remv" || $1 == "Purg" { n = $2; sub(":" native "$", "", n); print n }' \
+        "$W/simulation" | sort -u > "$W/removed"
+    awk -v native="$NATIVE_ARCH" '$1 == "Inst" { n = $2; sub(":" native "$", "", n); print n }' \
+        "$W/simulation" | sort -u > "$W/unpacked"
+}
+
+fetch_packages() {
+    apt-get "${STAGE_OPTS[@]}" "${TX_OPTS[@]}" --print-uris install "${REQ[@]}" 2>/dev/null < /dev/null |
+        awk -v archives="$W/archives" "$URIS_AWK" > "$W/archives.list"
+    if ! apt-get "${STAGE_OPTS[@]}" "${TX_OPTS[@]}" -d install "${REQ[@]}" < /dev/null >&2; then
+        fault "could not fetch every package the conversion needs"
+    fi
+    local deb
+    while IFS= read -r deb; do
+        [ -f "$deb" ] || fault "package file $deb is missing"
+    done < "$W/archives.list"
+}
+
+# Works out which recorded conffiles no installed package will ship after the
+# conversion: unmodified ones get deleted, edited ones are kept.
+plan_conffiles() {
+    local deb pkg md5 path current
+    local -a unchanged
+    local -A changing seen
+    : > "$W/shipped"
+    while IFS= read -r deb; do
+        dpkg-deb --fsys-tarfile "$deb" 2>/dev/null | tar -t 2>/dev/null | sed -n 's|^\./etc/|/etc/|p' >> "$W/shipped"
+    done < "$W/archives.list"
+    sort -u "$W/unpacked" "$W/removed" > "$W/changing"
+    comm -23 "$W/installed.names" "$W/changing" > "$W/unchanged"
+    load_lines unchanged "$W/unchanged"
+    if [ ${#unchanged[@]} -gt 0 ]; then
+        dpkg-query -L "${unchanged[@]}" 2>/dev/null | grep '^/etc/' >> "$W/shipped"
+    fi
+    sort -u -o "$W/shipped" "$W/shipped"
+
+    while IFS= read -r pkg; do changing[$pkg]=1; done < "$W/changing"
+    dpkg-query -W -f="$CONFFILES_FORMAT" 2>/dev/null |
+        awk -v native="$NATIVE_ARCH" "$CONFFILES_AWK" > "$W/conffiles.recorded"
+    : > "$W/conffiles"
+    while IFS=$'\t' read -r pkg md5 path; do
+        [ -n "${changing[$pkg]:-}" ] || continue
+        [ -z "${seen[$path]:-}" ] || continue
+        seen[$path]=1
+        if grep -qxF -- "$path" "$W/shipped"; then
+            continue
+        fi
+        if ! [ -f "$path" ] || [ -L "$path" ]; then
+            continue
+        fi
+        current=$(md5sum < "$path" | cut -d' ' -f1)
+        if [ "$current" = "$md5" ]; then
+            printf 'D\t%s\n' "$path" >> "$W/conffiles"
+        else
+            printf 'K\t%s\n' "$path" >> "$W/conffiles"
+        fi
+    done < "$W/conffiles.recorded"
+}
+
+# Auto-installed packages that stay but were needed only by packages the
+# conversion removes; they become wanted in their own right afterwards.
+#
+# The relationships of the installed versions decide this, so it reads them
+# from dpkg rather than from apt, which describes the candidate versions.
+read -r -d '' WANTED_AWK <<'EOF'
+# A relation of a foreign-architecture package names the package of its own
+# architecture when that one is installed.
+function names(list, arch, out,   n, parts, i, d, k) {
+    n = split(list, parts, /[,|]/); k = 0
+    for (i = 1; i <= n; i++) {
+        d = parts[i]; sub(/\(.*$/, "", d); sub(/\[.*$/, "", d); gsub(/[ \t]/, "", d)
+        sub(/:any$/, "", d); sub(":" native "$", "", d)
+        if (d == "") continue
+        if (d !~ /:/ && arch != native && arch != "all" && ((d ":" arch) in pkgs)) d = d ":" arch
+        out[++k] = d
+    }
+    return k
+}
+$1 == "installed" {
+    p = ($3 == native || $3 == "all") ? $2 : $2 ":" $3
+    pkgs[p] = 1; archof[p] = $3; rel[p] = $4; prov[p] = $5
+}
+END {
+    for (p in pkgs) {
+        n = names(prov[p], native, v)
+        for (i = 1; i <= n; i++) providers[v[i]] = providers[v[i]] " " p
+    }
+    for (p in pkgs) {
+        gone = index(removed, " " p " ") > 0
+        n = names(rel[p], archof[p], d)
+        for (i = 1; i <= n; i++) {
+            m = split(d[i] providers[d[i]], q, " ")
+            for (j = 1; j <= m; j++) {
+                if (gone) needed_by_removed[q[j]] = 1
+                else if (q[j] != p) needed_by_kept[q[j]] = 1
+            }
+        }
+    }
+    for (p in needed_by_removed)
+        if ((p in pkgs) && !(p in needed_by_kept) && index(auto, " " p " ") && !index(removed, " " p " "))
+            print p
+}
+EOF
+
+plan_wanted() {
+    local -a removed auto
+    load_lines removed "$W/removed"
+    load_lines auto "$W/auto"
+    dpkg-query -W -f='${db:Status-Status}\t${Package}\t${Architecture}\t${Pre-Depends}, ${Depends}, ${Recommends}\t${Provides}\n' \
+        2>/dev/null |
+        awk -F'\t' -v native="$NATIVE_ARCH" -v removed=" ${removed[*]} " -v auto=" ${auto[*]} " "$WANTED_AWK" |
+        sort -u > "$W/wanted"
+}
+
+write_report() {
+    local name succ path kind
+    local -a removed unpacked
+    local -A gone=() new=()
+    load_lines removed "$W/removed"
+    load_lines unpacked "$W/unpacked"
+    for name in "${removed[@]}"; do gone[$name]=1; done
+    for name in "${unpacked[@]}"; do new[$name]=1; done
+    {
+        for name in "${removed[@]}"; do
+            succ=
+            [ -z "${REPLACEMENTS[$name]+set}" ] || succ=${REPLACEMENTS[$name]}
+            if [ -n "$succ" ] && { [ -n "${new[$succ]:-}" ] ||
+                    { [ -n "${INSTALLED[$succ]:-}" ] && [ -z "${gone[$succ]:-}" ]; }; }; then
+                printf 'replace: %s -> %s\n' "$name" "$succ"
+            else
+                printf 'remove: %s\n' "$name"
+            fi
+        done
+        for name in "${!KEEP[@]}"; do
+            [ -n "${gone[$name]:-}" ] || printf 'keep: %s\n' "$name"
+        done
+        while IFS= read -r path; do
+            printf 'disable source: %s\n' "$path"
+        done < "$W/stage/disabled"
+        while IFS=$'\t' read -r kind path; do
+            [ "$kind" = K ] && printf 'kept modified conffile: %s\n' "$path"
+        done < "$W/conffiles"
+    } | sort > "$W/report"
+}
+
+# --- applying the change -------------------------------------------------------
+
+write_record() {
+    {
+        echo "version=1"
+        echo "phase=$1"
+        echo "debian_mirror=$DEBIAN_MIRROR"
+        echo "debian_keyring=$DEBIAN_KEYRING"
+        echo "regolith_mirror=$REGOLITH_MIRROR"
+    } > "$STATE_FILE.new" && mv -f "$STATE_FILE.new" "$STATE_FILE"
+}
+
+# systemd's post-install script creates the machine id with a helper that
+# cannot work without a mounted /proc, as in a chroot. While packages change,
+# a wrapper on dpkg's search path keeps the existing id (or writes a fresh
+# one) when the helper fails.
+install_helpers() {
+    mkdir -p "$W/bin"
+    cat > "$W/bin/systemd-machine-id-setup" <<'EOF'
+#!/bin/sh
+for helper in /usr/bin/systemd-machine-id-setup /bin/systemd-machine-id-setup; do
+    if [ -x "$helper" ]; then
+        "$helper" "$@" 2>/dev/null && exit 0
+        break
+    fi
+done
+[ -s /etc/machine-id ] && exit 0
+id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') && [ ${#id} -eq 32 ] || exit 1
+printf '%s\n' "$id" > /etc/machine-id
+EOF
+    chmod 755 "$W/bin/systemd-machine-id-setup"
+}
+
+set_aside_conffiles() {
+    local kind path index=0
+    mkdir -p "$W/aside"
+    : > "$W/aside.map"
+    while IFS=$'\t' read -r kind path; do
+        index=$((index + 1))
+        if mv -f -- "$path" "$W/aside/$index"; then
+            printf '%s\t%s\t%s\n' "$index" "$kind" "$path" >> "$W/aside.map"
+        fi
+    done < "$W/conffiles"
+}
+
+put_back_conffiles() {
+    local index kind path
+    while IFS=$'\t' read -r index kind path; do
+        [ -e "$W/aside/$index" ] || [ -L "$W/aside/$index" ] || continue
+        mkdir -p -- "${path%/*}"
+        mv -f -- "$W/aside/$index" "$path"
+    done < "$W/aside.map"
+}
+
+run_transaction() {
+    local -a request=()
+    local -A present=()
+    local item name
+    # A package purged by an earlier attempt is unknown to apt now.
+    dpkg_packages "installed half-installed unpacked half-configured triggers-awaited triggers-pending config-files" \
+        > "$W/present"
+    while IFS=$'\t' read -r name _; do
+        present[$name]=1
+    done < "$W/present"
+    while IFS= read -r item; do
+        case "$item" in
+            *-)
+                [ -n "${present[${item%-}]:-}" ] || continue
+                ;;
+        esac
+        request+=("$item")
+    done < "$W/request"
+    apt-get "${STAGE_OPTS[@]}" "${TX_OPTS[@]}" install "${request[@]}" < /dev/null >&2
+}
+
+finish() {
+    local index kind path
+    local -a auto wanted
+
+    while IFS=$'\t' read -r index kind path; do
+        [ -e "$W/aside/$index" ] || [ -L "$W/aside/$index" ] || continue
+        if [ "$kind" = K ] && ! [ -e "$path" ] && ! [ -L "$path" ]; then
+            mkdir -p -- "${path%/*}"
+            mv -f -- "$W/aside/$index" "$path"
+        else
+            rm -f -- "$W/aside/$index"
+        fi
+    done < "$W/aside.map"
+
+    # Explicit version requests make apt mark packages as manually installed;
+    # give back the marks they had, then keep what the removed packages pulled in.
+    installed_names > "$W/installed.after"
+    comm -12 "$W/auto" "$W/installed.after" > "$W/auto.after"
+    load_lines auto "$W/auto.after"
+    [ ${#auto[@]} -eq 0 ] || apt-mark auto "${auto[@]}" > /dev/null
+    comm -12 "$W/wanted" "$W/installed.after" > "$W/wanted.after"
+    load_lines wanted "$W/wanted.after"
+    [ ${#wanted[@]} -eq 0 ] || apt-mark manual "${wanted[@]}" > /dev/null
+
+    if [ -e /etc/dpkg/origins/debian ]; then
+        ln -sfn debian /etc/dpkg/origins/default
+    fi
+    if [ -e /usr/lib/os-release ] && ! cmp -s /etc/os-release /usr/lib/os-release; then
+        rm -f /etc/os-release
+        ln -s ../usr/lib/os-release /etc/os-release
+    fi
+
+    if [ -n "$(dpkg --audit 2>/dev/null)" ] || ! apt-get "${STAGE_OPTS[@]}" check > /dev/null 2>&1; then
+        msg "the package database is not consistent yet; run $PROG --resume --yes again"
+        exit 4
+    fi
+    rm -rf "$STATE_DIR"
+}
+
+stopped_partway() {
+    write_record packages
+    msg "$1; run $PROG --resume --yes with the same mirror settings to finish"
+    exit 4
+}
+
+convert() {
+    local answer=
+
+    # apt would only report this as a signature failure, after downloading.
+    if ! { [ -f "$DEBIAN_KEYRING" ] && [ -r "$DEBIAN_KEYRING" ]; }; then
+        fault "the Debian archive keyring $DEBIAN_KEYRING is not a readable file"
+    fi
+    if [ -e "$STATE_DIR" ] || [ -L "$STATE_DIR" ]; then
+        rm -rf "$STATE_DIR"
+    fi
+    mkdir -p "$W"
+    WORK_CREATED=1
+    trap cleanup_work EXIT
+
+    render_sources
+    if ! apt-get "${STAGE_OPTS[@]}" -q -o APT::Update::Error-Mode=any update < /dev/null >&2; then
+        fault "cannot read the Debian archive at $DEBIAN_MIRROR or the Regolith archive at $REGOLITH_MIRROR"
+    fi
+    plan_packages
+    installed_names > "$W/installed.names"
+    fetch_packages
+    plan_conffiles
+    plan_wanted
+    write_report
+    cat "$W/report"
+
+    if [ "$DRY_RUN" = 1 ]; then
+        cleanup_work
+        exit 0
+    fi
+    if [ "$ASSUME_YES" = 0 ]; then
+        printf '%s: convert this system to Debian %s now? [y/N] ' "$PROG" "$SUITE" >&2
+        read -r answer || answer=
+        case "$answer" in
+            y|Y|yes|Yes|YES) ;;
+            *) cleanup_work; decline "conversion cancelled; nothing was changed" ;;
+        esac
+    fi
+
+    COMMITTED=1
+    trap - EXIT
+    write_record starting
+    dpkg_state > "$W/status.before"
+    if [ -d "$BACKUP_DIR" ]; then : > "$W/backup.existed"; fi
+    mkdir -p "$BACKUP_DIR"
+    rm -rf "$BACKUP_DIR/apt"
+    cp -a /etc/apt "$BACKUP_DIR/apt" || rollback "cannot back up /etc/apt"
+    apply_sources || rollback "cannot write the new package sources"
+    set_aside_conffiles
+    install_helpers
+    write_record packages
+    if ! run_transaction; then
+        dpkg_state > "$W/status.after"
+        if cmp -s "$W/status.before" "$W/status.after"; then
+            rollback "the package changes could not start"
+        fi
+        stopped_partway "the conversion stopped while packages were changing"
+    fi
+    finish
+}
+
+# A fault after the sources were written but before dpkg changed anything.
+rollback() {
+    put_back_conffiles
+    restore_sources
+    if [ -e "$W/backup.existed" ]; then
+        rm -rf "$BACKUP_DIR/apt"
+    else
+        rm -rf "$BACKUP_DIR"
+    fi
+    rm -rf "$STATE_DIR"
+    msg "$1; the system was restored to its previous state"
+    exit 3
+}
+
+resume() {
+    local report
+    if [ "$DRY_RUN" = 1 ]; then
+        [ -f "$W/report" ] && cat "$W/report"
+        exit 0
+    fi
+    [ -f "$W/request" ] || decline "the conversion record at $STATE_FILE is incomplete"
+    report=$(cat "$W/report" 2>/dev/null)
+    install_helpers
+    if [ ! -e "$W/aside.map" ]; then
+        # Stopped before packages started changing: carry on from the plan.
+        set_aside_conffiles
+    fi
+    write_record packages
+    if ! PATH="$W/bin:$PATH" dpkg --configure -a --force-confdef --force-confold < /dev/null >&2; then
+        stopped_partway "packages still fail to configure"
+    fi
+    if ! run_transaction; then
+        stopped_partway "the conversion stopped again while packages were changing"
+    fi
+    finish
+    [ -z "$report" ] || printf '%s\n' "$report"
+}
+
+preflight() {
+    local have_record=0 id version held stages broken
+    [ "$EUID" -eq 0 ] || decline "must be run as root"
+    if [ -e "$STATE_FILE" ]; then
+        have_record=1
+    fi
+    if [ "$RESUME" = 1 ] && [ "$have_record" = 0 ]; then
+        decline "there is no stopped conversion to resume ($STATE_FILE is missing)"
+    fi
+    if [ "$RESUME" = 0 ] && [ "$have_record" = 1 ]; then
+        decline "an earlier conversion stopped partway; run again with --resume"
+    fi
+    if [ "$have_record" = 0 ]; then
+        [ -e /etc/os-release ] || decline "/etc/os-release is missing; cannot tell which system this is"
+        id=$(awk -F= '$1 == "ID" { v = substr($0, 4); gsub(/^["\047]|["\047]$/, "", v); print v; exit }' /etc/os-release)
+        version=$(awk -F= '$1 == "VERSION_ID" { v = substr($0, 12); gsub(/^["\047]|["\047]$/, "", v); print v; exit }' /etc/os-release)
+        [ "$id" != debian ] || decline "this system already runs Debian"
+        [ "$id" = ubuntu ] || decline "this system does not identify as Ubuntu (ID=${id:-unset})"
+        [ "$version" = 26.04 ] || decline "only Ubuntu 26.04 can be converted; this system is ${version:-an unknown release}"
+    fi
+    if ! dpkg-query -W -f='${Package}\n' > /dev/null 2>&1; then
+        decline "dpkg cannot read its package database; repair it before converting"
+    fi
+    held=$(dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null | awk '$2 == "hold" { print $1 }' | sort -u | tr '\n' ' ')
+    [ -z "$held" ] || decline "held packages must be released first: ${held% }"
+    if [ "$ASSUME_YES" = 0 ] && ! [ -t 0 ]; then
+        decline "standard input is not a terminal; pass --yes to proceed without questions"
+    fi
+    if [ "$KEYRING_GIVEN" = 0 ] && ! [ -e "$DEFAULT_KEYRING" ]; then
+        decline "the Debian archive keyring $DEFAULT_KEYRING is missing;" \
+            "install debian-archive-keyring or pass --debian-keyring"
+    fi
+    if [ "$RESUME" = 0 ]; then
+        stages=$(scan_sources | awk -F'\t' '$1 == "regolith" && $2 != "testing" && $2 != "unstable" { print $2 }' |
+            sort -u | tr '\n' ' ')
+        if [ -n "$stages" ] && [ -z "$REGOLITH_STAGE" ]; then
+            decline "Regolith sources use the ${stages% } stage; pass --regolith-stage testing or unstable"
+        fi
+        broken=$(dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null |
+            awk '$3 != "ok" || ($4 != "installed" && $4 != "not-installed" && $4 != "config-files") { print $1 }' |
+            sort -u | tr '\n' ' ')
+        [ -z "$broken" ] || decline "packages are incomplete or broken: ${broken% }; repair them with dpkg --configure -a first"
+    fi
+}
+
+parse_args "$@"
+preflight
+NATIVE_ARCH=$(dpkg --print-architecture) || decline "dpkg cannot report the system architecture"
+for name in "${!REPLACEMENTS[@]}"; do
+    REPLACEMENTS[$name]=${REPLACEMENTS[$name]//@ARCH@/$NATIVE_ARCH}
+done
+if [ "$RESUME" = 1 ]; then
+    resume
+else
+    convert
+fi
+exit 0

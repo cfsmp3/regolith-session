@@ -1,0 +1,87 @@
+#!/bin/sh
+# regolith-convert-to-debian must refuse, with status 2 and one line
+# starting with its name on stderr, every run it cannot carry out: unknown
+# arguments, unusable option values, and runs by a user other than root.
+# None of these runs may touch the package sources. A real conversion is
+# not attempted: it would replace the testbed's operating system.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+prog=regolith-convert-to-debian
+fail=0
+
+# Runs the command as an unprivileged user, even when the test runs as root.
+as_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        setpriv --reuid=nobody --regid=nogroup --clear-groups -- "$@"
+    else
+        "$@"
+    fi
+}
+
+apt_state() {
+    find /etc/apt -type f -exec md5sum {} + 2>/dev/null | sort
+}
+
+# refuse <name> <expected stderr text> <args...>
+refuse() {
+    name=$1 want=$2; shift 2
+    rc=0
+    as_user "$prog" "$@" >"$tmp/out" 2>"$tmp/err" </dev/null || rc=$?
+    if [ "$rc" -ne 2 ]; then
+        echo "FAIL: $name: exit status $rc, expected 2: $(cat "$tmp/err")"; fail=1
+    elif [ "$(wc -l <"$tmp/err")" -ne 1 ] || ! grep -q "^$prog: " "$tmp/err"; then
+        echo "FAIL: $name: expected one '$prog:' line on stderr: $(cat "$tmp/err")"; fail=1
+    elif ! grep -qF -- "$want" "$tmp/err"; then
+        echo "FAIL: $name: stderr lacks '$want': $(cat "$tmp/err")"; fail=1
+    else
+        echo "ok: $name: $(cat "$tmp/err")"
+    fi
+}
+
+if [ "$(stat -c %a "/usr/sbin/$prog")" != 755 ]; then
+    echo "FAIL: /usr/sbin/$prog is not mode 0755"; fail=1
+fi
+
+apt_state >"$tmp/apt.before"
+
+rc=0
+as_user "$prog" --help >"$tmp/out" 2>"$tmp/err" || rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^Usage: $prog" "$tmp/out" && grep -q -- '--resume' "$tmp/out"; then
+    echo "ok: --help prints the usage"
+else
+    echo "FAIL: --help: exit $rc: $(cat "$tmp/out" "$tmp/err")"; fail=1
+fi
+
+refuse "unknown argument" "unknown argument '--no-such-option'" --no-such-option
+refuse "missing value" "option --debian-mirror needs a value" --debian-mirror
+refuse "unknown stage" "unknown Regolith stage 'stable'" --regolith-stage stable
+refuse "mirror with a space" "must not contain spaces" --debian-mirror 'http://deb.debian.org/debian main'
+refuse "mirror that is no URL" "must be a URL" --regolith-mirror archive.regolith-desktop.com
+refuse "not root" "must be run as root" --yes --dry-run
+
+apt_state >"$tmp/apt.after"
+if ! diff -u "$tmp/apt.before" "$tmp/apt.after"; then
+    echo "FAIL: the files below /etc/apt changed"; fail=1
+fi
+
+# Nothing else built from this source may pull the converter in.
+pulled=$(awk -v prog="$prog" '
+    BEGIN { RS = ""; FS = "\n" }
+    {
+        pkg = ""; rel = 0
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^Package:/) { pkg = $i; sub(/^Package:[ \t]*/, "", pkg) }
+            if ($i ~ /^[A-Za-z-]+:/) rel = ($i ~ /^(Pre-Depends|Depends|Recommends):/)
+            if (rel && $i ~ ("(^|[ ,:|])" prog "([ ,(]|$)")) hit = 1
+        }
+        if (pkg != "" && pkg != prog && hit) print pkg
+        hit = 0
+    }' debian/control)
+if [ -n "$pulled" ]; then
+    echo "FAIL: these packages depend on or recommend $prog: $(echo "$pulled" | tr '\n' ' ')"; fail=1
+else
+    echo "ok: no other package of this source depends on or recommends $prog"
+fi
+
+exit $fail

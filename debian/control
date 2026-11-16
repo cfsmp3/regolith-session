@@ -107,3 +107,18 @@ Description: Additional files for regolith X11 session
  This package contains the idle monitor and polkit agent autostart desktop
  files for GNOME Flashback releases that still start them from autostart.
 
+Package: regolith-convert-to-debian
+Section: admin
+Architecture: any
+Depends: ${misc:Depends},
+    apt,
+    debian-archive-keyring,
+    dpkg (>= 1.19.1)
+Description: Convert a Regolith system from Ubuntu to Debian
+ This package contains regolith-convert-to-debian, which moves a Regolith
+ desktop installed on Ubuntu 26.04 to Debian forky in a single pass. The
+ package sources switch to Debian and to Regolith's Debian archive, the
+ installed packages move to their Debian versions, and the system identity
+ files end up saying Debian. The packages of the running kernel stay
+ installed as a fallback. Nothing depends on this package; install it only
+ to perform a conversion.

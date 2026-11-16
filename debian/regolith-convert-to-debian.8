@@ -1,0 +1,110 @@
+.TH REGOLITH-CONVERT-TO-DEBIAN 8 "November 2026" "Regolith" "System Administration"
+.SH NAME
+regolith-convert-to-debian \- move a Regolith system from Ubuntu 26.04 to Debian forky
+.SH SYNOPSIS
+.B regolith-convert-to-debian
+.RI [ options ]
+.SH DESCRIPTION
+.B regolith-convert-to-debian
+converts the machine it runs on from Ubuntu 26.04 to Debian forky in one run,
+keeping Regolith installed from Regolith's Debian archive.
+.PP
+The Ubuntu package sources are replaced by
+.IR /etc/apt/sources.list.d/debian.sources .
+Regolith sources move to the Regolith Debian archive of the same stage
+.RB ( testing
+or
+.BR unstable ).
+Other sources are disabled where they are: deb822 entries get
+.BR "Enabled: no" ,
+one-line entries are commented out.
+The original files below
+.I /etc/apt
+are kept in
+.IR /var/backups/regolith-convert-to-debian/apt .
+.PP
+Every installed package then moves to the version the Debian and Regolith
+archives provide. Ubuntu packages that Debian provides under another name are
+replaced (the coreutils variants, the generic kernel metapackages,
+.BR linux-firmware );
+Ubuntu packages without a Debian version are removed, except packages
+installed from a third-party archive that Debian does not provide, and the
+packages of the running kernel, which stay as a fallback until the Debian
+kernel has booted. Unmodified configuration files that no installed package
+ships any more are deleted; modified ones are kept.
+Finally
+.I /etc/os-release
+and the dpkg origin are switched to Debian.
+.PP
+The program prints one line for each package it keeps, removes or replaces,
+for each source file it disables, and for each modified obsolete
+configuration file it keeps, then asks for confirmation.
+.SH OPTIONS
+.TP
+.BI \-\-debian\-mirror " URL"
+Debian archive to use. Default:
+.IR http://deb.debian.org/debian .
+.TP
+.BI \-\-debian\-keyring " FILE"
+Keyring that signs the Debian archive. Default:
+.IR /usr/share/keyrings/debian-archive-keyring.gpg .
+.TP
+.BI \-\-regolith\-mirror " URL"
+Regolith archive to use. Default:
+.IR https://archive.regolith-desktop.com .
+.TP
+.BI \-\-regolith\-stage " STAGE"
+Regolith stage to use on Debian,
+.B testing
+or
+.BR unstable .
+Needed when the Regolith sources use another stage, such as
+.BR stable .
+.TP
+.B \-\-yes
+Do not ask for confirmation. Without it, standard input must be a terminal.
+.TP
+.B \-\-dry\-run
+Print what would change and stop. Only the package lists below
+.I /var/lib/apt/lists
+may be refreshed.
+.TP
+.B \-\-resume
+Finish a conversion that stopped while packages were changing.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the options and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+The conversion, or the dry run, completed.
+.TP
+.B 2
+The program declined to start (not root, not Ubuntu 26.04, held or broken
+packages, the default Debian keyring missing, a usage error, or an earlier run
+that has to be resumed). Nothing was changed.
+.TP
+.B 3
+A failure before any package changed, such as an unreachable archive, a bad
+signature or an unreadable
+.B \-\-debian\-keyring
+file. Everything was restored.
+.TP
+.B 4
+A failure after packages started changing. Run the program again with
+.B \-\-resume \-\-yes
+and the same mirror options to finish.
+.SH FILES
+.TP
+.I /var/lib/regolith-convert-to-debian/state
+Record of a conversion that stopped partway.
+.TP
+.I /var/backups/regolith-convert-to-debian/apt
+Copy of
+.I /etc/apt
+from before the conversion.
+.SH NOTES
+Run the conversion from a text console rather than from the graphical session
+it replaces. The boot loader is not changed beyond what the Debian kernel
+packages do themselves; check that the Debian kernel boots before removing
+the old one.
